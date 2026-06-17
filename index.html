@@ -6,11 +6,12 @@
 <!-- Unlisted: reachable by link but not indexed by search engines. -->
 <meta name="robots" content="noindex, nofollow" />
 <title>Insulin Dashboard</title>
-<script src="https://cdn.plot.ly/plotly-2.35.2.min.js" charset="utf-8"></script>
+<script src="https://cdn.jsdelivr.net/npm/echarts@5.5.1/dist/echarts.min.js"></script>
 <style>
   :root {
     --bg: #0f1419; --panel: #1a2029; --ink: #e6edf3; --muted: #8b98a5;
-    --rapid: #4f9dff; --long: #ff8a5b; --accent: #ff5b7f; --line: #2a313c;
+    --rapid: #4f9dff; --long: #ff8a5b; --accent: #ff5b7f; --tir: #5bd6a0;
+    --line: #2a313c;
   }
   * { box-sizing: border-box; }
   body {
@@ -27,6 +28,7 @@
     padding: 8px 16px; border-radius: 999px; cursor: pointer; font-size: 14px;
   }
   .tab.active { color: var(--ink); border-color: var(--accent); background: #221820; }
+  .hint { color: var(--muted); font-size: 12px; margin: -8px 0 4px; }
   .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 12px; }
   .card {
     background: var(--panel); border: 1px solid var(--line);
@@ -38,20 +40,22 @@
   .chart {
     background: var(--panel); border: 1px solid var(--line);
     border-radius: 12px; padding: 8px; margin-top: 16px;
-    min-height: 300px;   /* guard so a chart never collapses to a sliver */
   }
-  .chart > .js-plotly-plot { width: 100%; }
+  #daily, #glucose, #gmi { height: 380px; }
+  #hour { height: 300px; }
 
   @media (max-width: 600px) {
     header { padding: 16px 14px 6px; }
     h1 { font-size: 19px; }
     .wrap { padding: 10px 12px 32px; }
-    .tabs { flex-wrap: wrap; gap: 6px; margin: 12px 0 14px; }
+    .tabs { flex-wrap: wrap; gap: 6px; margin: 12px 0 10px; }
     .tab { padding: 7px 13px; font-size: 13px; }
     .cards { grid-template-columns: 1fr 1fr; gap: 8px; }
     .card { padding: 12px 13px; }
     .card .v { font-size: 21px; }
-    .chart { padding: 4px; margin-top: 10px; min-height: 260px; }
+    .chart { padding: 4px; margin-top: 10px; }
+    #daily, #glucose, #gmi { height: 320px; }
+    #hour { height: 260px; }
   }
 </style>
 </head>
@@ -66,9 +70,11 @@
     <div class="tab" data-days="30">Past month</div>
     <div class="tab" data-days="0">All time</div>
   </div>
+  <div class="hint">Drag the slider under a chart, or pinch / scroll on it, to zoom the time range.</div>
   <div class="cards" id="cards"></div>
   <div class="chart" id="daily"></div>
   <div class="chart" id="glucose"></div>
+  <div class="chart" id="gmi"></div>
   <div class="chart" id="hour"></div>
 </div>
 
@@ -85,21 +91,48 @@ document.getElementById("sub").textContent =
   " · " + events.length + " doses on record";
 
 const dayKey = d => d.toISOString().slice(0, 10);
-const fmt = (n, dp = 0) => n.toLocaleString(undefined, { maximumFractionDigits: dp });
+const fmt = (n, dp = 0) => Number.isFinite(n)
+  ? n.toLocaleString(undefined, { maximumFractionDigits: dp }) : "—";
 
-const isSmall = () => window.innerWidth < 600;
-function baseLayout() {
-  const s = isSmall();
-  return {
-    height: s ? 300 : 380, autosize: true,
-    paper_bgcolor: "transparent", plot_bgcolor: "transparent",
-    font: { color: "#e6edf3", size: s ? 11 : 13 },
-    margin: s ? { l: 38, r: 10, t: 28, b: 34 } : { l: 48, r: 16, t: 36, b: 40 },
-    legend: { orientation: "h", y: s ? 1.22 : 1.15, font: { size: s ? 10 : 12 } },
-    xaxis: { gridcolor: "#2a313c", automargin: true },
-    yaxis: { gridcolor: "#2a313c", automargin: true },
-  };
-}
+// ECharts dark theme bits shared across charts.
+const AX = { axisLine: { lineStyle: { color: "#2a313c" } },
+             axisLabel: { color: "#8b98a5" },
+             splitLine: { lineStyle: { color: "#1f2630" } } };
+const C = { rapid: "#4f9dff", long: "#ff8a5b", roll: "#ff5b7f",
+            glu: "#4f9dff", tir: "#5bd6a0" };
+
+const cDaily = echarts.init(document.getElementById("daily"), null, { renderer: "canvas" });
+const cGlucose = echarts.init(document.getElementById("glucose"), null, { renderer: "canvas" });
+const cGmi = echarts.init(document.getElementById("gmi"), null, { renderer: "canvas" });
+const cHour = echarts.init(document.getElementById("hour"), null, { renderer: "canvas" });
+
+// --- GMI / estimated A1C (Bergenstal 2018): 3.31 + 0.02392 * mean glucose ---
+const GMI = mg => 3.31 + 0.02392 * mg;
+const ROLL = 14;  // days — GMI needs >= ~14 days of CGM data to be meaningful
+
+// Precompute rolling series once over all history, so windows near their start
+// still get a proper trailing-14-day value.
+const gluDates = Object.keys(glucose).sort();
+const insByDate = {};
+events.forEach(e => { const k = dayKey(e.d); insByDate[k] = (insByDate[k] || 0) + e.units; });
+
+const gmiByDate = {};      // date -> rolling GMI %
+const insRollByDate = {};  // date -> rolling insulin units/day
+gluDates.forEach((k, idx) => {
+  const end = new Date(k + "T00:00:00");
+  const startW = new Date(end); startW.setDate(startW.getDate() - (ROLL - 1));
+  let sumMgN = 0, sumN = 0, sumIns = 0;
+  for (let j = idx; j >= 0; j--) {
+    if (new Date(gluDates[j] + "T00:00:00") < startW) break;
+    const g = glucose[gluDates[j]];
+    sumMgN += g.mean * g.n; sumN += g.n;
+  }
+  for (let dd = new Date(startW); dd <= end; dd.setDate(dd.getDate() + 1)) {
+    sumIns += insByDate[dayKey(new Date(dd))] || 0;
+  }
+  if (sumN > 0) gmiByDate[k] = +GMI(sumMgN / sumN).toFixed(2);
+  insRollByDate[k] = +(sumIns / ROLL).toFixed(2);
+});
 
 function windowStart(days) {
   if (days === 0) return firstEvent;
@@ -117,7 +150,6 @@ function render(days) {
   const spanDays = Math.max(1, Math.round((anchor - start) / 86400000));
   const perDay = total / spanDays;
 
-  // glucose days within the window
   const gDays = Object.keys(glucose).filter(k => {
     const d = new Date(k + "T00:00:00");
     return d >= start && d <= anchor;
@@ -139,11 +171,12 @@ function render(days) {
   if (gDays.length) {
     cards.push(["Avg glucose", fmt(avgGlu) + " <small>mg/dL</small>"]);
     cards.push(["Time in range", fmt(avgTir) + " <small>%</small>"]);
+    cards.push(["Est. A1C (GMI)", fmt(GMI(avgGlu), 1) + " <small>%</small>"]);
   }
   document.getElementById("cards").innerHTML = cards
     .map(([k, v]) => `<div class="card"><div class="k">${k}</div><div class="v">${v}</div></div>`).join("");
 
-  // --- daily stacked bar + 7-day rolling avg ---
+  // --- daily stacked bar + rolling avg ---
   const dates = [];
   for (let d = new Date(start); d <= anchor; d.setDate(d.getDate() + 1)) dates.push(dayKey(new Date(d)));
   const agg = {};
@@ -152,71 +185,142 @@ function render(days) {
   const rapidY = dates.map(k => agg[k].rapid);
   const longY = dates.map(k => agg[k].long);
   const totalY = dates.map(k => agg[k].rapid + agg[k].long);
-  const win = days === 7 ? 3 : 7;
-  const roll = totalY.map((_, i) => {
-    const s = Math.max(0, i - win + 1), slice = totalY.slice(s, i + 1);
-    return slice.reduce((a, b) => a + b, 0) / slice.length;
+  const rollWin = days === 7 ? 3 : 7;
+  const rollY = totalY.map((_, i) => {
+    const s = Math.max(0, i - rollWin + 1), slice = totalY.slice(s, i + 1);
+    return +(slice.reduce((a, b) => a + b, 0) / slice.length).toFixed(2);
   });
+  // show the whole selected window by default; the slider/pinch zooms in
+  const zStart = 0;
 
-  Plotly.newPlot("daily", [
-    { x: dates, y: rapidY, type: "bar", name: "rapid", marker: { color: "#4f9dff" } },
-    { x: dates, y: longY, type: "bar", name: "long", marker: { color: "#ff8a5b" } },
-    { x: dates, y: roll, type: "scatter", mode: "lines", name: win + "-day avg",
-      line: { color: "#ff5b7f", width: 2 } },
-  ], Object.assign({}, baseLayout(), {
-    barmode: "stack", title: "Insulin per day (units)",
-  }), { displayModeBar: false, responsive: false });
+  cDaily.setOption({
+    backgroundColor: "transparent",
+    textStyle: { color: "#e6edf3" },
+    tooltip: { trigger: "axis", axisPointer: { type: "shadow" } },
+    legend: { data: ["rapid", "long", rollWin + "-day avg"], top: 4,
+              textStyle: { color: "#8b98a5" } },
+    grid: { left: 8, right: 12, top: 38, bottom: 56, containLabel: true },
+    xAxis: Object.assign({ type: "category", data: dates }, AX),
+    yAxis: Object.assign({ type: "value", name: "units" }, AX),
+    dataZoom: [
+      { type: "inside", start: zStart, end: 100 },
+      { type: "slider", start: zStart, end: 100, height: 16, bottom: 14,
+        borderColor: "#2a313c", fillerColor: "rgba(255,91,127,0.15)",
+        handleStyle: { color: "#ff5b7f" }, textStyle: { color: "#8b98a5" } },
+    ],
+    series: [
+      { name: "rapid", type: "bar", stack: "ins", data: rapidY, itemStyle: { color: C.rapid } },
+      { name: "long", type: "bar", stack: "ins", data: longY, itemStyle: { color: C.long } },
+      { name: rollWin + "-day avg", type: "line", data: rollY, smooth: true,
+        symbol: "none", lineStyle: { color: C.roll, width: 2 } },
+    ],
+  }, true);
 
-  // --- glucose context: daily mean + time-in-range band ---
+  // --- glucose context: daily mean + TIR, with 70-180 band ---
   const gMean = gDays.map(k => glucose[k].mean);
   const gTir = gDays.map(k => glucose[k].tir);
-  Plotly.newPlot("glucose", [
-    { x: gDays, y: gMean, type: "scatter", mode: "lines", name: "mean glucose",
-      line: { color: "#4f9dff", width: 2 }, yaxis: "y" },
-    { x: gDays, y: gTir, type: "scatter", mode: "lines", name: "time in range %",
-      line: { color: "#5bd6a0", width: 1.5, dash: "dot" }, yaxis: "y2" },
-  ], Object.assign({}, baseLayout(), {
-    title: "Glucose context (daily mean & time-in-range)",
-    shapes: [{ type: "rect", xref: "paper", x0: 0, x1: 1, yref: "y",
-               y0: 70, y1: 180, fillcolor: "#5bd6a0", opacity: 0.08, line: { width: 0 } }],
-    yaxis: { gridcolor: "#2a313c", title: "mg/dL" },
-    yaxis2: { overlaying: "y", side: "right", range: [0, 100],
-              title: "TIR %", showgrid: false },
-  }), { displayModeBar: false, responsive: false });
+  cGlucose.setOption({
+    backgroundColor: "transparent",
+    textStyle: { color: "#e6edf3" },
+    tooltip: { trigger: "axis" },
+    legend: { data: ["mean glucose", "time in range"], top: 4,
+              textStyle: { color: "#8b98a5" } },
+    grid: { left: 8, right: 12, top: 38, bottom: 50, containLabel: true },
+    xAxis: Object.assign({ type: "category", data: gDays }, AX),
+    yAxis: [
+      Object.assign({ type: "value", name: "mg/dL" }, AX),
+      Object.assign({ type: "value", name: "TIR %", min: 0, max: 100, position: "right",
+                      splitLine: { show: false } }, AX),
+    ],
+    dataZoom: [
+      { type: "inside" },
+      { type: "slider", height: 16, bottom: 12, borderColor: "#2a313c",
+        fillerColor: "rgba(79,157,255,0.15)", handleStyle: { color: C.glu },
+        textStyle: { color: "#8b98a5" } },
+    ],
+    series: [
+      { name: "mean glucose", type: "line", data: gMean, smooth: true, symbol: "none",
+        lineStyle: { color: C.glu, width: 2 },
+        markArea: { silent: true, itemStyle: { color: "rgba(91,214,160,0.08)" },
+                    data: [[{ yAxis: 70 }, { yAxis: 180 }]] } },
+      { name: "time in range", type: "line", yAxisIndex: 1, data: gTir, smooth: true,
+        symbol: "none", lineStyle: { color: C.tir, width: 1.5, type: "dotted" } },
+    ],
+  }, true);
+
+  // --- GMI / estimated A1C over time, with rolling insulin overlaid ---
+  const gmiY = gDays.map(k => gmiByDate[k] ?? null);
+  const insY = gDays.map(k => insRollByDate[k] ?? null);
+  cGmi.setOption({
+    backgroundColor: "transparent",
+    textStyle: { color: "#e6edf3" },
+    title: { text: "Est. A1C (GMI, 14-day) vs insulin", left: 8, top: 4,
+             textStyle: { color: "#e6edf3", fontSize: 14, fontWeight: 500 } },
+    tooltip: { trigger: "axis",
+      valueFormatter: v => (v == null ? "—" : (+v).toFixed(2)) },
+    legend: { data: ["est. A1C (GMI)", "insulin u/day"], top: 4, right: 8,
+              textStyle: { color: "#8b98a5" } },
+    grid: { left: 8, right: 12, top: 40, bottom: 50, containLabel: true },
+    xAxis: Object.assign({ type: "category", data: gDays }, AX),
+    yAxis: [
+      Object.assign({ type: "value", name: "A1C %", scale: true }, AX),
+      Object.assign({ type: "value", name: "u/day", min: 0, position: "right",
+                      splitLine: { show: false } }, AX),
+    ],
+    dataZoom: [
+      { type: "inside" },
+      { type: "slider", height: 16, bottom: 12, borderColor: "#2a313c",
+        fillerColor: "rgba(255,138,91,0.15)", handleStyle: { color: C.long },
+        textStyle: { color: "#8b98a5" } },
+    ],
+    series: [
+      { name: "est. A1C (GMI)", type: "line", data: gmiY, smooth: true,
+        symbol: "none", connectNulls: true, lineStyle: { color: C.tir, width: 2.5 },
+        itemStyle: { color: C.tir } },
+      { name: "insulin u/day", type: "line", yAxisIndex: 1, data: insY, smooth: true,
+        symbol: "none", connectNulls: true, lineStyle: { color: C.long, width: 2 },
+        areaStyle: { color: "rgba(255,138,91,0.10)" }, itemStyle: { color: C.long } },
+    ],
+  }, true);
 
   // --- doses by hour of day ---
   const byHour = new Array(24).fill(0);
   inWin.forEach(e => byHour[e.d.getHours()] += 1);
-  Plotly.newPlot("hour", [
-    { x: [...Array(24).keys()], y: byHour, type: "bar", marker: { color: "#4f9dff" } },
-  ], Object.assign({}, baseLayout(), {
-    height: 300, title: "Doses by time of day",
-    xaxis: { gridcolor: "#2a313c", dtick: 3, title: "hour" },
-  }), { displayModeBar: false, responsive: false });
+  cHour.setOption({
+    backgroundColor: "transparent",
+    textStyle: { color: "#e6edf3" },
+    title: { text: "Doses by time of day", left: 8, top: 4,
+             textStyle: { color: "#e6edf3", fontSize: 14, fontWeight: 500 } },
+    tooltip: { trigger: "axis" },
+    grid: { left: 8, right: 12, top: 40, bottom: 24, containLabel: true },
+    xAxis: Object.assign({ type: "category", data: [...Array(24).keys()], name: "hour" }, AX),
+    yAxis: Object.assign({ type: "value" }, AX),
+    series: [{ type: "bar", data: byHour, itemStyle: { color: C.rapid } }],
+  }, true);
 }
 
+const charts = [cDaily, cGlucose, cGmi, cHour];
 const tabs = [...document.querySelectorAll(".tab")];
+let currentDays = 30;
 tabs.forEach(t => t.addEventListener("click", () => {
   tabs.forEach(x => x.classList.remove("active"));
   t.classList.add("active");
   currentDays = Number(t.dataset.days);
   render(currentDays);
 }));
-// default to Past month
-let currentDays = 30;
 tabs[1].classList.add("active");
 render(currentDays);
 
-// Resize only when the WIDTH changes. Mobile browsers fire resize on scroll
-// (the address bar shows/hides, changing height) — reacting to that is what
-// made the charts collapse. Re-render on real width changes / orientation only.
+// Resize only on real width change; ignore height-only events (mobile address
+// bar showing/hiding on scroll). Container heights are fixed in CSS, so this is
+// just to re-flow on rotation / window resize.
 let lastW = window.innerWidth;
 let rt;
 window.addEventListener("resize", () => {
-  if (window.innerWidth === lastW) return;   // height-only (scroll): ignore
+  if (window.innerWidth === lastW) return;
   lastW = window.innerWidth;
   clearTimeout(rt);
-  rt = setTimeout(() => render(currentDays), 150);
+  rt = setTimeout(() => charts.forEach(c => c.resize()), 150);
 });
 </script>
 </body>
