@@ -38,8 +38,21 @@
   .chart {
     background: var(--panel); border: 1px solid var(--line);
     border-radius: 12px; padding: 8px; margin-top: 16px;
+    min-height: 300px;   /* guard so a chart never collapses to a sliver */
   }
   .chart > .js-plotly-plot { width: 100%; }
+
+  @media (max-width: 600px) {
+    header { padding: 16px 14px 6px; }
+    h1 { font-size: 19px; }
+    .wrap { padding: 10px 12px 32px; }
+    .tabs { flex-wrap: wrap; gap: 6px; margin: 12px 0 14px; }
+    .tab { padding: 7px 13px; font-size: 13px; }
+    .cards { grid-template-columns: 1fr 1fr; gap: 8px; }
+    .card { padding: 12px 13px; }
+    .card .v { font-size: 21px; }
+    .chart { padding: 4px; margin-top: 10px; min-height: 260px; }
+  }
 </style>
 </head>
 <body>
@@ -74,13 +87,19 @@ document.getElementById("sub").textContent =
 const dayKey = d => d.toISOString().slice(0, 10);
 const fmt = (n, dp = 0) => n.toLocaleString(undefined, { maximumFractionDigits: dp });
 
-const layoutBase = {
-  height: 380, autosize: true,
-  paper_bgcolor: "transparent", plot_bgcolor: "transparent",
-  font: { color: "#e6edf3" }, margin: { l: 48, r: 16, t: 36, b: 40 },
-  legend: { orientation: "h", y: 1.15 },
-  xaxis: { gridcolor: "#2a313c" }, yaxis: { gridcolor: "#2a313c" },
-};
+const isSmall = () => window.innerWidth < 600;
+function baseLayout() {
+  const s = isSmall();
+  return {
+    height: s ? 300 : 380, autosize: true,
+    paper_bgcolor: "transparent", plot_bgcolor: "transparent",
+    font: { color: "#e6edf3", size: s ? 11 : 13 },
+    margin: s ? { l: 38, r: 10, t: 28, b: 34 } : { l: 48, r: 16, t: 36, b: 40 },
+    legend: { orientation: "h", y: s ? 1.22 : 1.15, font: { size: s ? 10 : 12 } },
+    xaxis: { gridcolor: "#2a313c", automargin: true },
+    yaxis: { gridcolor: "#2a313c", automargin: true },
+  };
+}
 
 function windowStart(days) {
   if (days === 0) return firstEvent;
@@ -144,9 +163,9 @@ function render(days) {
     { x: dates, y: longY, type: "bar", name: "long", marker: { color: "#ff8a5b" } },
     { x: dates, y: roll, type: "scatter", mode: "lines", name: win + "-day avg",
       line: { color: "#ff5b7f", width: 2 } },
-  ], Object.assign({}, layoutBase, {
+  ], Object.assign({}, baseLayout(), {
     barmode: "stack", title: "Insulin per day (units)",
-  }), { displayModeBar: false, responsive: true });
+  }), { displayModeBar: false, responsive: false });
 
   // --- glucose context: daily mean + time-in-range band ---
   const gMean = gDays.map(k => glucose[k].mean);
@@ -156,35 +175,49 @@ function render(days) {
       line: { color: "#4f9dff", width: 2 }, yaxis: "y" },
     { x: gDays, y: gTir, type: "scatter", mode: "lines", name: "time in range %",
       line: { color: "#5bd6a0", width: 1.5, dash: "dot" }, yaxis: "y2" },
-  ], Object.assign({}, layoutBase, {
+  ], Object.assign({}, baseLayout(), {
     title: "Glucose context (daily mean & time-in-range)",
     shapes: [{ type: "rect", xref: "paper", x0: 0, x1: 1, yref: "y",
                y0: 70, y1: 180, fillcolor: "#5bd6a0", opacity: 0.08, line: { width: 0 } }],
     yaxis: { gridcolor: "#2a313c", title: "mg/dL" },
     yaxis2: { overlaying: "y", side: "right", range: [0, 100],
               title: "TIR %", showgrid: false },
-  }), { displayModeBar: false, responsive: true });
+  }), { displayModeBar: false, responsive: false });
 
   // --- doses by hour of day ---
   const byHour = new Array(24).fill(0);
   inWin.forEach(e => byHour[e.d.getHours()] += 1);
   Plotly.newPlot("hour", [
     { x: [...Array(24).keys()], y: byHour, type: "bar", marker: { color: "#4f9dff" } },
-  ], Object.assign({}, layoutBase, {
+  ], Object.assign({}, baseLayout(), {
     height: 300, title: "Doses by time of day",
     xaxis: { gridcolor: "#2a313c", dtick: 3, title: "hour" },
-  }), { displayModeBar: false, responsive: true });
+  }), { displayModeBar: false, responsive: false });
 }
 
 const tabs = [...document.querySelectorAll(".tab")];
 tabs.forEach(t => t.addEventListener("click", () => {
   tabs.forEach(x => x.classList.remove("active"));
   t.classList.add("active");
-  render(Number(t.dataset.days));
+  currentDays = Number(t.dataset.days);
+  render(currentDays);
 }));
 // default to Past month
+let currentDays = 30;
 tabs[1].classList.add("active");
-render(30);
+render(currentDays);
+
+// Resize only when the WIDTH changes. Mobile browsers fire resize on scroll
+// (the address bar shows/hides, changing height) — reacting to that is what
+// made the charts collapse. Re-render on real width changes / orientation only.
+let lastW = window.innerWidth;
+let rt;
+window.addEventListener("resize", () => {
+  if (window.innerWidth === lastW) return;   // height-only (scroll): ignore
+  lastW = window.innerWidth;
+  clearTimeout(rt);
+  rt = setTimeout(() => render(currentDays), 150);
+});
 </script>
 </body>
 </html>
